@@ -1,0 +1,551 @@
+﻿   1: #!/usr/local/bin/python
+   2: import os
+   3: import io
+   4: import json
+   5: import numpy as np
+   6: from datetime import datetime, timedelta
+   7: import random
+   8: from ConfigLoader import logger, path_parser, config_model, dates, stock_symbols, vocab, vocab_size
+   9: 
+  10: 
+  11: class DataPipe:
+  12: 
+  13:     def __init__(self):
+  14:         # load path
+  15:         self.movement_path = path_parser.movement
+  16:         self.tweet_path = path_parser.preprocessed
+  17:         self.vocab_path = path_parser.vocab
+  18:         self.glove_path = path_parser.glove
+  19: 
+  20:         # load dates
+  21:         self.train_start_date = dates['train_start_date']
+  22:         self.train_end_date = dates['train_end_date']
+  23:         self.dev_start_date = dates['dev_start_date']
+  24:         self.dev_end_date = dates['dev_end_date']
+  25:         self.test_start_date = dates['test_start_date']
+  26:         self.test_end_date = dates['test_end_date']
+  27: 
+  28:         # load model config
+  29:         self.batch_size = config_model['batch_size']
+  30:         self.shuffle = config_model['shuffle']
+  31: 
+  32:         self.max_n_days = config_model['max_n_days']
+  33:         self.max_n_words = config_model['max_n_words']
+  34:         self.max_n_msgs = config_model['max_n_msgs']
+  35: 
+  36:         self.word_embed_type = config_model['word_embed_type']
+  37:         self.word_embed_size = config_model['word_embed_size']
+  38:         self.stock_embed_size = config_model['stock_embed_size']
+  39:         self.init_stock_with_word= config_model['init_stock_with_word']
+  40:         self.price_embed_size = config_model['word_embed_size']
+  41:         self.y_size = config_model['y_size']
+  42: 
+  43:         assert self.word_embed_type in ('rand', 'glove')
+  44: 
+  45:     @staticmethod
+  46:     def _convert_token_to_id(token, token_id_dict):
+  47:         if token not in token_id_dict:
+  48:             token = 'UNK'
+  49:         return token_id_dict[token]
+  50: 
+  51:     def _get_start_end_date(self, phase):
+  52:         """
+  53:             phase: train, dev, test, unit_test
+  54:             => start_date & end_date
+  55:         """
+  56:         assert phase in {'train', 'dev', 'test', 'whole', 'unit_test'}
+  57:         if phase == 'train':
+  58:             return self.train_start_date, self.train_end_date
+  59:         elif phase == 'dev':
+  60:             return self.dev_start_date, self.dev_end_date
+  61:         elif phase == 'test':
+  62:             return self.test_start_date, self.test_end_date
+  63:         elif phase == 'whole':
+  64:             return self.train_start_date, self.test_end_date
+  65:         else:
+  66:             return '2012-07-23', '2012-08-05'  # '2014-07-23', '2014-08-05'
+  67: 
+  68:     def _get_batch_size(self, phase):
+  69:         """
+  70:             phase: train, dev, test, unit_test
+  71:         """
+  72:         if phase == 'train':
+  73:             return self.batch_size
+  74:         elif phase == 'unit_test':
+  75:             return 5
+  76:         else:
+  77:             return 1
+  78: 
+  79:     def index_token(self, token_list, key='id', type='word'):
+  80:         assert key in ('id', 'token')
+  81:         assert type in ('word', 'stock')
+  82:         indexed_token_dict = dict()
+  83: 
+  84:         if type == 'word':
+  85:             token_list_cp = list(token_list)  # un-change the original input
+  86:             token_list_cp.insert(0, 'UNK')  # for unknown tokens
+  87:         else:
+  88:             token_list_cp = token_list
+  89: 
+  90:         if key == 'id':
+  91:             for id in range(len(token_list_cp)):
+  92:                 indexed_token_dict[id] = token_list_cp[id]
+  93:         else:
+  94:             for id in range(len(token_list_cp)):
+  95:                 indexed_token_dict[token_list_cp[id]] = id
+  96: 
+  97:         # id_token_dict = dict(zip(token_id_dict.values(), token_id_dict.keys()))
+  98:         return indexed_token_dict
+  99: 
+ 100:     def build_stock_id_word_id_dict(self):
+ 101:         # load vocab, user, stock list
+ 102:         stock_id_word_id_dict = dict()
+ 103: 
+ 104:         vocab_id_dict = self.index_token(vocab, key='token')
+ 105:         id_stock_dict = self.index_token(stock_symbols, type='stock')
+ 106: 
+ 107:         for (stock_id, stock_symbol) in id_stock_dict.items():
+ 108:             stock_symbol = stock_symbol.lower()
+ 109:             if stock_symbol in vocab_id_dict:
+ 110:                 stock_id_word_id_dict[stock_id] = vocab_id_dict[stock_symbol]
+ 111:             else:
+ 112:                 stock_id_word_id_dict[stock_id] = None
+ 113:         return stock_id_word_id_dict
+ 114: 
+ 115:     def _convert_words_to_ids(self, words, vocab_id_dict):
+ 116:         """
+ 117:             Replace each word in the data set with its index in the dictionary
+ 118: 
+ 119:         :param words: words in tweet
+ 120:         :param vocab_id_dict: dict, vocab-id
+ 121:         :return:
+ 122:         """
+ 123:         return [self._convert_token_to_id(w, vocab_id_dict) for w in words]
+ 124: 
+ 125:     def _get_prices_and_ts(self, ss, main_target_date):
+ 126: 
+ 127:         def _get_mv_class(data, use_one_hot=False):
+ 128:             mv = float(data[1])
+ 129:             if self.y_size == 2:
+ 130:                 if mv <= 1e-7:
+ 131:                     return [1.0, 0.0] if use_one_hot else 0
+ 132:                 else:
+ 133:                     return [0.0, 1.0] if use_one_hot else 1
+ 134: 
+ 135:             if self.y_size == 3:
+ 136:                 threshold_1, threshold_2 = -0.004, 0.005
+ 137:                 if mv < threshold_1:
+ 138:                     return [1.0, 0.0, 0.0] if use_one_hot else 0
+ 139:                 elif mv < threshold_2:
+ 140:                     return [0.0, 1.0, 0.0] if use_one_hot else 1
+ 141:                 else:
+ 142:                     return [0.0, 0.0, 1.0] if use_one_hot else 2
+ 143: 
+ 144:         def _get_y(data):
+ 145:             return _get_mv_class(data, use_one_hot=True)
+ 146: 
+ 147:         def _get_prices(data):
+ 148:             return [float(p) for p in data[3:6]]
+ 149: 
+ 150:         def _get_mv_percents(data):
+ 151:             return _get_mv_class(data)
+ 152: 
+ 153:         ts, ys, prices, mv_percents, main_mv_percent = list(), list(), list(), list(), 0.0
+ 154:         d_t_min = main_target_date - timedelta(days=self.max_n_days-1)
+ 155: 
+ 156:         stock_movement_path = os.path.join(str(self.movement_path), '{}.txt'.format(ss))
+ 157:         with io.open(stock_movement_path, 'r', encoding='utf8') as movement_f:
+ 158:             for line in movement_f:  # descend
+ 159:                 data = line.split('\t')
+ 160:                 t = datetime.strptime(data[0], '%Y-%m-%d').date()
+ 161:                 # logger.info(t)
+ 162:                 if t == main_target_date:
+ 163:                     # logger.info(t)
+ 164:                     ts.append(t)
+ 165:                     ys.append(_get_y(data))
+ 166:                     main_mv_percent = data[1]
+ 167:                     if -0.005 <= float(main_mv_percent) < 0.0055:  # discard sample with low movement percent
+ 168:                         return None
+ 169:                 if d_t_min <= t < main_target_date:
+ 170:                     ts.append(t)
+ 171:                     ys.append(_get_y(data))
+ 172:                     prices.append(_get_prices(data))  # high, low, close
+ 173:                     mv_percents.append(_get_mv_percents(data))
+ 174:                 if t < d_t_min:  # one additional line for x_1_prices. not a referred trading day
+ 175:                     prices.append(_get_prices(data))
+ 176:                     mv_percents.append(_get_mv_percents(data))
+ 177:                     break
+ 178: 
+ 179:         T = len(ts)
+ 180:         if len(ys) != T or len(prices) != T or len(mv_percents) != T:  # ensure data legibility
+ 181:             return None
+ 182: 
+ 183:         # ascend
+ 184:         for item in (ts, ys, mv_percents, prices):
+ 185:             item.reverse()
+ 186: 
+ 187:         prices_and_ts = {
+ 188:             'T': T,
+ 189:             'ts': ts,
+ 190:             'ys': ys,
+ 191:             'main_mv_percent': main_mv_percent,
+ 192:             'mv_percents': mv_percents,
+ 193:             'prices': prices,
+ 194:         }
+ 195: 
+ 196:         return prices_and_ts
+ 197: 
+ 198:     def _get_unaligned_corpora(self, ss, main_target_date, vocab_id_dict):
+ 199:         def get_ss_index(word_seq, ss):
+ 200:             ss = ss.lower()
+ 201:             ss_index = len(word_seq) - 1  # init
+ 202:             if ss in word_seq:
+ 203:                 ss_index = word_seq.index(ss)
+ 204:             else:
+ 205:                 if '$' in word_seq:
+ 206:                     dollar_index = word_seq.index('$')
+ 207:                     if dollar_index is not len(word_seq) - 1 and ss in word_seq[dollar_index + 1]:
+ 208:                         ss_index = dollar_index + 1
+ 209:                     else:
+ 210:                         for index in range(dollar_index + 1, len(word_seq)):
+ 211:                             if ss in word_seq[index]:
+ 212:                                 ss_index = index
+ 213:                                 break
+ 214:             return ss_index
+ 215: 
+ 216:         unaligned_corpora = list()  # list of sets: (d, msgs, ss_indices)
+ 217:         stock_tweet_path = os.path.join(str(self.tweet_path), ss)
+ 218: 
+ 219:         d_d_max = main_target_date - timedelta(days=1)
+ 220:         d_d_min = main_target_date - timedelta(days=self.max_n_days)
+ 221: 
+ 222:         d = d_d_max  # descend
+ 223:         while d >= d_d_min:
+ 224:             msg_fp = os.path.join(stock_tweet_path, d.isoformat())
+ 225:             if os.path.exists(msg_fp):
+ 226:                 word_mat = np.zeros([self.max_n_msgs, self.max_n_words], dtype=np.int32)
+ 227:                 n_word_vec = np.zeros([self.max_n_msgs, ], dtype=np.int32)
+ 228:                 ss_index_vec = np.zeros([self.max_n_msgs, ], dtype=np.int32)
+ 229:                 msg_id = 0
+ 230:                 with open(msg_fp, 'r') as tweet_f:
+ 231:                     for line in tweet_f:
+ 232:                         msg_dict = json.loads(line)
+ 233:                         text = msg_dict['text']
+ 234:                         if not text:
+ 235:                             continue
+ 236: 
+ 237:                         words = text[:self.max_n_words]
+ 238:                         word_ids = self._convert_words_to_ids(words, vocab_id_dict)
+ 239:                         n_words = len(word_ids)
+ 240: 
+ 241:                         n_word_vec[msg_id] = n_words
+ 242:                         word_mat[msg_id, :n_words] = word_ids
+ 243:                         ss_index_vec[msg_id] = get_ss_index(words, ss)
+ 244: 
+ 245:                         msg_id += 1
+ 246:                         if msg_id == self.max_n_msgs:
+ 247:                             break
+ 248:                 corpus = [d, word_mat[:msg_id], ss_index_vec[:msg_id], n_word_vec[:msg_id], msg_id]
+ 249:                 unaligned_corpora.append(corpus)
+ 250:             d -= timedelta(days=1)
+ 251: 
+ 252:         unaligned_corpora.reverse()  # ascend
+ 253:         return unaligned_corpora
+ 254: 
+ 255:     def _trading_day_alignment(self, ts, T, unaligned_corpora):
+ 256:         aligned_word_tensor = np.zeros([T, self.max_n_msgs, self.max_n_words], dtype=np.int32)
+ 257:         aligned_ss_index_mat = np.zeros([T, self.max_n_msgs], dtype=np.int32)
+ 258:         aligned_n_words_mat = np.zeros([T, self.max_n_msgs], dtype=np.int32)
+ 259:         aligned_n_msgs_vec = np.zeros([T, ], dtype=np.int32)
+ 260: 
+ 261:         # list for gathering
+ 262:         aligned_msgs = [[] for _ in range(T)]
+ 263:         aligned_ss_indices = [[] for _ in range(T)]
+ 264:         aligned_n_words = [[] for _ in range(T)]
+ 265:         aligned_n_msgs = [[] for _ in range(T)]
+ 266: 
+ 267:         corpus_t_indices = []
+ 268:         max_threshold = 0
+ 269: 
+ 270:         for corpus in unaligned_corpora:
+ 271:             d = corpus[0]
+ 272:             for t in range(T):
+ 273:                 if d < ts[t]:
+ 274:                     corpus_t_indices.append(t)
+ 275:                     break
+ 276: 
+ 277:         assert len(corpus_t_indices) == len(unaligned_corpora)
+ 278: 
+ 279:         for i in range(len(unaligned_corpora)):
+ 280:             corpus, t = unaligned_corpora[i], corpus_t_indices[i]
+ 281:             word_mat, ss_index_vec, n_word_vec, n_msgs = corpus[1:]
+ 282:             aligned_msgs[t].extend(word_mat)
+ 283:             aligned_ss_indices[t].extend(ss_index_vec)
+ 284:             aligned_n_words[t].append(n_word_vec)
+ 285:             aligned_n_msgs[t].append(n_msgs)
+ 286: 
+ 287:         def is_eligible():
+ 288:             n_fails = len([0 for n_msgs in aligned_n_msgs if sum(n_msgs) == 0])
+ 289:             return n_fails <= max_threshold
+ 290: 
+ 291:         if not is_eligible():
+ 292:             return None
+ 293: 
+ 294:         # gather into nd_array and clip exceeded part
+ 295:         for t in range(T):
+ 296:             n_msgs = sum(aligned_n_msgs[t])
+ 297: 
+ 298:             if aligned_msgs[t] and aligned_ss_indices[t] and aligned_n_words[t]:
+ 299:                 msgs, ss_indices, n_word = np.vstack(aligned_msgs[t]), np.hstack(aligned_ss_indices[t]), np.hstack(aligned_n_words[t])
+ 300:                 assert len(msgs) == len(ss_indices) == len(n_word)
+ 301:                 n_msgs = min(n_msgs, self.max_n_msgs)  # clip length
+ 302:                 aligned_n_msgs_vec[t] = n_msgs
+ 303:                 aligned_word_tensor[t, :n_msgs] = msgs[:n_msgs]
+ 304:                 aligned_ss_index_mat[t, :n_msgs] = ss_indices[:n_msgs]
+ 305:                 aligned_n_words_mat[t, :n_msgs] = n_word[:n_msgs]
+ 306: 
+ 307:         aligned_info_dict = {
+ 308:             'msgs': aligned_word_tensor,
+ 309:             'ss_indices': aligned_ss_index_mat,
+ 310:             'n_words': aligned_n_words_mat,
+ 311:             'n_msgs': aligned_n_msgs_vec,
+ 312:         }
+ 313: 
+ 314:         return aligned_info_dict
+ 315: 
+ 316:     def sample_gen_from_one_stock(self, vocab_id_dict, stock_id_dict, s, phase):
+ 317:         """
+ 318:             generate samples for the given stock.
+ 319: 
+ 320:             => tuple, (x:dict, y_:int, price_seq: list of floats, prediction_date_str:str)
+ 321:         """
+ 322:         start_date, end_date = self._get_start_end_date(phase)
+ 323:         stock_movement_path = os.path.join(str(self.movement_path), '{}.txt'.format(s))
+ 324:         main_target_dates = []
+ 325: 
+ 326:         with open(stock_movement_path, 'r') as movement_f:
+ 327:             for line in movement_f:
+ 328:                 data = line.split('\t')
+ 329:                 main_target_date = datetime.strptime(data[0], '%Y-%m-%d').date()
+ 330:                 main_target_date_str = main_target_date.isoformat()
+ 331: 
+ 332:                 if start_date <= main_target_date_str < end_date:
+ 333:                     main_target_dates.append(main_target_date)
+ 334: 
+ 335:         if self.shuffle:  # shuffle data
+ 336:             random.shuffle(main_target_dates)
+ 337: 
+ 338:         for main_target_date in main_target_dates:
+ 339:             # logger.info('start _get_unaligned_corpora')
+ 340:             unaligned_corpora = self._get_unaligned_corpora(s, main_target_date, vocab_id_dict)
+ 341:             # logger.info('start _get_prices_and_ts')
+ 342:             prices_and_ts = self._get_prices_and_ts(s, main_target_date)
+ 343:             if not prices_and_ts:
+ 344:                 continue
+ 345: 
+ 346:             # logger.info('start _trading_day_alignment')
+ 347:             aligned_info_dict = self._trading_day_alignment(prices_and_ts['ts'], prices_and_ts['T'], unaligned_corpora)
+ 348:             if not aligned_info_dict:
+ 349:                 continue
+ 350: 
+ 351:             sample_dict = {
+ 352:                 # meta info
+ 353:                 'stock': self._convert_token_to_id(s, stock_id_dict),
+ 354:                 'main_target_date': main_target_date.isoformat(),
+ 355:                 'T': prices_and_ts['T'],
+ 356:                 # target
+ 357:                 'ys': prices_and_ts['ys'],
+ 358:                 'main_mv_percent': prices_and_ts['main_mv_percent'],
+ 359:                 'mv_percents': prices_and_ts['mv_percents'],
+ 360:                 # source
+ 361:                 'prices': prices_and_ts['prices'],
+ 362:                 'msgs': aligned_info_dict['msgs'],
+ 363:                 'ss_indices': aligned_info_dict['ss_indices'],
+ 364:                 'n_words': aligned_info_dict['n_words'],
+ 365:                 'n_msgs': aligned_info_dict['n_msgs'],
+ 366:             }
+ 367: 
+ 368:             yield sample_dict
+ 369: 
+ 370:     def batch_gen(self, phase):
+ 371:         batch_size = self._get_batch_size(phase)
+ 372:         # prepare vocab, user, stock dict
+ 373:         vocab_id_dict = self.index_token(vocab, key='token')
+ 374:         stock_id_dict = self.index_token(stock_symbols, key='token', type='stock')
+ 375:         generators = [self.sample_gen_from_one_stock(vocab_id_dict, stock_id_dict, s, phase) for s in stock_symbols]
+ 376:         # logger.info('{0} Generators prepared...'.format(len(generators)))
+ 377: 
+ 378:         while True:
+ 379:             # start_time = time.time()
+ 380:             # logger.info('start to collect a batch...')
+ 381:             stock_batch = np.zeros([batch_size, ], dtype=np.int32)
+ 382:             T_batch = np.zeros([batch_size, ], dtype=np.int32)
+ 383:             y_batch = np.zeros([batch_size, self.max_n_days, self.y_size], dtype=np.float32)
+ 384:             main_mv_percent_batch = np.zeros([batch_size, ], dtype=np.float32)
+ 385:             mv_percent_batch = np.zeros([batch_size, self.max_n_days], dtype=np.float32)
+ 386:             price_batch = np.zeros([batch_size, self.max_n_days, 3], dtype=np.float32)
+ 387:             word_batch = np.zeros([batch_size, self.max_n_days, self.max_n_msgs, self.max_n_words], dtype=np.int32)
+ 388:             ss_index_batch = np.zeros([batch_size, self.max_n_days, self.max_n_msgs], dtype=np.int32)
+ 389:             n_msgs_batch = np.zeros([batch_size, self.max_n_days], dtype=np.int32)
+ 390:             n_words_batch = np.zeros([batch_size, self.max_n_days, self.max_n_msgs], dtype=np.int32)
+ 391: 
+ 392:             sample_id = 0
+ 393:             while sample_id < batch_size:
+ 394:                 gen_id = random.randint(0, len(generators)-1)
+ 395:                 try:
+ 396:                     sample_dict = next(generators[gen_id])
+ 397:                     T = sample_dict['T']
+ 398:                     # meta
+ 399:                     stock_batch[sample_id] = sample_dict['stock']
+ 400:                     T_batch[sample_id] = T
+ 401:                     # target
+ 402:                     y_batch[sample_id, :T] = sample_dict['ys']
+ 403:                     main_mv_percent_batch[sample_id] = sample_dict['main_mv_percent']
+ 404:                     mv_percent_batch[sample_id, :T] = sample_dict['mv_percents']
+ 405:                     # source
+ 406:                     price_batch[sample_id, :T] = sample_dict['prices']
+ 407:                     word_batch[sample_id, :T] = sample_dict['msgs']
+ 408:                     ss_index_batch[sample_id, :T] = sample_dict['ss_indices']
+ 409:                     n_msgs_batch[sample_id, :T] = sample_dict['n_msgs']
+ 410:                     n_words_batch[sample_id, :T] = sample_dict['n_words']
+ 411: 
+ 412:                     sample_id += 1
+ 413:                 except StopIteration:
+ 414:                     del generators[gen_id]
+ 415:                     if generators:
+ 416:                         continue
+ 417:                     else:
+ 418:                         raise StopIteration
+ 419: 
+ 420:             batch_dict = {
+ 421:                 # meta
+ 422:                 'batch_size': sample_id,
+ 423:                 'stock_batch': stock_batch,
+ 424:                 'T_batch': T_batch,
+ 425:                 # target
+ 426:                 'y_batch': y_batch,
+ 427:                 'main_mv_percent_batch': main_mv_percent_batch,
+ 428:                 'mv_percent_batch': mv_percent_batch,
+ 429:                 # source
+ 430:                 'price_batch': price_batch,
+ 431:                 'word_batch': word_batch,
+ 432:                 'ss_index_batch': ss_index_batch,
+ 433:                 'n_msgs_batch': n_msgs_batch,
+ 434:                 'n_words_batch': n_words_batch,
+ 435:             }
+ 436: 
+ 437:             yield batch_dict
+ 438: 
+ 439:     def batch_gen_by_stocks(self, phase):
+ 440:         batch_size = 2000
+ 441:         vocab_id_dict = self.index_token(vocab, key='token')
+ 442:         stock_id_dict = self.index_token(stock_symbols, key='token', type='stock')
+ 443: 
+ 444:         for s in stock_symbols:
+ 445:             gen = self.sample_gen_from_one_stock(vocab_id_dict, stock_id_dict, s, phase)
+ 446: 
+ 447:             stock_batch = np.zeros([batch_size, ], dtype=np.int32)
+ 448:             T_batch = np.zeros([batch_size, ], dtype=np.int32)
+ 449:             n_msgs_batch = np.zeros([batch_size, self.max_n_days], dtype=np.int32)
+ 450:             n_words_batch = np.zeros([batch_size, self.max_n_days, self.max_n_msgs], dtype=np.int32)
+ 451:             y_batch = np.zeros([batch_size, self.max_n_days, self.y_size], dtype=np.float32)
+ 452:             price_batch = np.zeros([batch_size, self.max_n_days, 3], dtype=np.float32)
+ 453:             mv_percent_batch = np.zeros([batch_size, self.max_n_days], dtype=np.float32)
+ 454:             word_batch = np.zeros([batch_size, self.max_n_days, self.max_n_msgs, self.max_n_words], dtype=np.int32)
+ 455:             ss_index_batch = np.zeros([batch_size, self.max_n_days, self.max_n_msgs], dtype=np.int32)
+ 456:             main_mv_percent_batch = np.zeros([batch_size, ], dtype=np.float32)
+ 457: 
+ 458:             sample_id = 0
+ 459:             while True:
+ 460:                 try:
+ 461:                     sample_info_dict = next(gen)
+ 462:                     T = sample_info_dict['T']
+ 463: 
+ 464:                     # meta
+ 465:                     stock_batch[sample_id] = sample_info_dict['stock']
+ 466:                     T_batch[sample_id] = sample_info_dict['T']
+ 467:                     # target
+ 468:                     y_batch[sample_id, :T] = sample_info_dict['ys']
+ 469:                     main_mv_percent_batch[sample_id] = sample_info_dict['main_mv_percent']
+ 470:                     mv_percent_batch[sample_id, :T] = sample_info_dict['mv_percents']
+ 471:                     # source
+ 472:                     price_batch[sample_id, :T] = sample_info_dict['prices']
+ 473:                     word_batch[sample_id, :T] = sample_info_dict['msgs']
+ 474:                     ss_index_batch[sample_id, :T] = sample_info_dict['ss_indices']
+ 475:                     n_msgs_batch[sample_id, :T] = sample_info_dict['n_msgs']
+ 476:                     n_words_batch[sample_id, :T] = sample_info_dict['n_words']
+ 477: 
+ 478:                     sample_id += 1
+ 479:                 except StopIteration:
+ 480:                     break
+ 481: 
+ 482:             n_sample_threshold = 1
+ 483:             if sample_id < n_sample_threshold:
+ 484:                 continue
+ 485: 
+ 486:             batch_dict = {
+ 487:                 # meta
+ 488:                 's': s,
+ 489:                 'batch_size': sample_id,
+ 490:                 'stock_batch': stock_batch[:sample_id],
+ 491:                 'T_batch': T_batch[:sample_id],
+ 492:                 # target
+ 493:                 'y_batch': y_batch[:sample_id],
+ 494:                 'main_mv_percent_batch': main_mv_percent_batch[:sample_id],
+ 495:                 'mv_percent_batch': mv_percent_batch[:sample_id],
+ 496:                 # source
+ 497:                 'price_batch': price_batch[:sample_id],
+ 498:                 'word_batch': word_batch[:sample_id],
+ 499:                 'ss_index_batch': ss_index_batch[:sample_id],
+ 500:                 'n_msgs_batch': n_msgs_batch[:sample_id],
+ 501:                 'n_words_batch': n_words_batch[:sample_id],
+ 502:             }
+ 503: 
+ 504:             yield batch_dict
+ 505: 
+ 506:     def sample_mv_percents(self, phase):
+ 507:         main_mv_percents = []
+ 508:         for s in stock_symbols:
+ 509:             start_date, end_date = self._get_start_end_date(phase)
+ 510:             stock_mv_path = os.path.join(str(self.movement_path), '{}.txt'.format(s))
+ 511:             main_target_dates = []
+ 512: 
+ 513:             with open(stock_mv_path, 'r') as movement_f:
+ 514:                 for line in movement_f:
+ 515:                     data = line.split('\t')
+ 516:                     main_target_date = datetime.strptime(data[0], '%Y-%m-%d').date()
+ 517:                     main_target_date_str = main_target_date.isoformat()
+ 518: 
+ 519:                     if start_date <= main_target_date_str < end_date:
+ 520:                         main_target_dates.append(main_target_date)
+ 521: 
+ 522:             for main_target_date in main_target_dates:
+ 523:                 prices_and_ts = self._get_prices_and_ts(s, main_target_date)
+ 524:                 if not prices_and_ts:
+ 525:                     continue
+ 526:                 main_mv_percents.append(prices_and_ts['main_mv_percent'])
+ 527: 
+ 528:             logger.info('finished: {}'.format(s))
+ 529: 
+ 530:         return main_mv_percents
+ 531: 
+ 532:     def init_word_table(self):
+ 533:         word_table_init = np.random.random((vocab_size, self.word_embed_size)) * 2 - 1  # [-1.0, 1.0]
+ 534: 
+ 535:         if self.word_embed_type is not 'rand':
+ 536:             n_replacement = 0
+ 537:             vocab_id_dict = self.index_token(vocab, key='token')
+ 538: 
+ 539:             with io.open(self.glove_path, 'r', encoding='utf-8') as f:
+ 540:                 for line in f:
+ 541:                     tuples = line.split()
+ 542:                     word, embed = tuples[0], [float(embed_col) for embed_col in tuples[1:]]
+ 543:                     if word in ['<unk>', 'unk']:  # unify UNK
+ 544:                         word = 'UNK'
+ 545:                     if word in vocab_id_dict:
+ 546:                         n_replacement += 1
+ 547:                         word_id = vocab_id_dict[word]
+ 548:                         word_table_init[word_id] = embed
+ 549: 
+ 550:             logger.info('ASSEMBLE: word table #replacement: {}'.format(n_replacement))
+ 551:         return word_table_init

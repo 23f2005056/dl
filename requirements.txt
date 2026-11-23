@@ -1,0 +1,24 @@
+
+# StockNet Project - Direct Dependencies
+# Python: 3.12.10 (64-bit)
+
+# Deep Learning
+torch>=2.1.0
+
+# Scientific Computing and Data Handling
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+
+# Text Processing and Configuration
+nltk>=3.8.0
+PyYAML>=6.0
+
+# Visualization and Experiment Tracking
+matplotlib>=3.8.0
+tqdm>=4.66.0
+tensorboard>=2.14.0
+
+# Testing
+pytest>=7.4.0

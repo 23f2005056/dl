@@ -1,23 +1,18 @@
-# Python environments
+# Python
+__pycache__/
+*.py[cod]
 .venv/
 venv/
 
-# Python cache
-__pycache__/
-*.pyc
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Environment variables and secrets
+# Environment variables and credentials
 .env
 .env.*
-stocknet-dataset/
+!.env.example
+
 # IDE
 .vscode/
+.idea/
 
-# Temporary files
+# Generated outputs
 *.log
-.DS_Store
-
-# Large datasets - review before uploading
+stocknet-dataset/

@@ -20,7 +20,10 @@ venv/
 # Large datasets - review before uploading
 
 
-experiments/*/
+experiments/*/*
+!experiments/*/*.csv
+!experiments/*/summary.json
+
 *.pt
 
 P18-1183.pdf

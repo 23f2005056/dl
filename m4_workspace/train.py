@@ -20,6 +20,7 @@ from vmd import VMD
 from losses import kl_lambda, stocknet_loss
 from predict import write_csv
 from e1_integration import E1Integration
+from mie import build_glove_matrix
 
 CODE, DATA = ROOT / "stocknet-code", ROOT / "stocknet-dataset"
 
@@ -29,14 +30,14 @@ def make_builder(stocks, batch_size):
     sb = StockNetSampleBuilder(m, PriceReader(DATA / "price/preprocessed"),
                                TweetReader(tweet_root=DATA / "tweet/preprocessed",
                                            vocab_path=CODE / "res/vocab.txt"))
-    return StockNetBatchBuilder(sb, stocks or list(m.stock_id_dict), batch_size=batch_size), len(m.vocab_id_dict)
+    return StockNetBatchBuilder(sb, stocks or list(m.stock_id_dict), batch_size=batch_size), m
 
 def forward(model, b):
     """E0: StockNet as-is (MIE concatenates the 3 raw prices -> [B,5,103]).
     E1: MIE tweet vector c_t [B,5,100] + M2 GRU price encoder [B,5,50] -> [B,5,150] -> VMD -> ATA."""
     if getattr(model, "e1", None) is None:
         return model(b)
-    _, c_t = model.mie(b["tweet_ids"], b["price_features"], b["n_words"], b["n_msgs"])
+    _, c_t = model.mie(b["tweet_ids"], b["price_features"], b["n_words"], b["n_msgs"], b.get("ss_index"))
     x_t = model.e1(c_t, b["price_features"], b["T_lengths"])
     g, kl = model.vmd(x_t, b["T_lengths"], b["y_historical"])
     logits, attn, aux_logits = model.ata(g, b["T_lengths"])
@@ -76,15 +77,21 @@ def main():
     ap.add_argument("--overfit", type=int, help="overfit N real samples (smoke test)")
     ap.add_argument("--run-name")
     ap.add_argument("--price-encoder", choices=["raw", "gru"], default="raw",help="raw = E0 (3 raw price features), gru = E1 (M2 GRU price encoder)")
+    ap.add_argument("--glove", default=str(CODE / "res" / "glove.twitter.27B.50d.txt"),help="GloVe Twitter 50d file (frozen embeddings, as in the original)")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(CODE / "src/config.yml", encoding="utf-8"))["model"]
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    builder, vocab = make_builder(args.stocks.split(",") if args.stocks else None,
-                                  args.overfit or cfg["batch_size"])
+    builder, maps = make_builder(args.stocks.split(",") if args.stocks else None,
+                                 args.overfit or cfg["batch_size"])
+    if not Path(args.glove).is_file():
+        raise SystemExit(f"GloVe file not found: {args.glove} (frozen random embeddings would be invalid)")
+    glove = build_glove_matrix(maps.vocab_id_dict, args.glove, embed_dim=50)
     x_size = 103 if args.price_encoder == "raw" else 150
-    model = StockNet(vmd_module=VMD(x_size=x_size, dropout=cfg["dropout_vmd_in"]), vocab_size=vocab)
+    model = StockNet(vmd_module=VMD(x_size=x_size, dropout=cfg["dropout_vmd_in"]),
+                     vocab_size=len(maps.vocab_id_dict), pretrained_embeddings=glove,
+                     freeze_embeddings=True, daily_att="y")
     if args.price_encoder == "gru":
         model.e1 = E1Integration()      # submodule: trained by Adam, saved in best_dev_model.pt
     model = model.to(device)

@@ -5,7 +5,7 @@ def prepare_torch_batch(np_batch: dict, device: torch.device) -> dict:
     """
     Converts M2's NumPy batch dictionary into device-agnostic PyTorch tensors.
     """
-    return {
+    batch = {
         # Text input to MIE: [B, 5, 30, 40]
         "tweet_ids": torch.from_numpy(np_batch["word_batch"]).long().to(device),
 
@@ -32,3 +32,9 @@ def prepare_torch_batch(np_batch: dict, device: torch.device) -> dict:
         "stock_names": np_batch.get("stock_names", []),
         "target_dates": np_batch.get("target_dates", []),
     }
+
+    # Stock symbol token index in each tweet for faithful BiGRU state extraction (Model.py:173-181)
+    if "ss_index_batch" in np_batch:
+        batch["ss_index"] = torch.from_numpy(np_batch["ss_index_batch"]).long().to(device) # [B, 5, 30]
+
+    return batch

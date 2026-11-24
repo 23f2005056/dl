@@ -15,6 +15,7 @@ from batch_builder import StockNetBatchBuilder
 from batch_adapter import prepare_torch_batch
 from mie import MarketInformationEncoder
 from ata import AttentiveTemporalAuxiliary
+from stocknet import StockNet
 
 def test_real_pipeline():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -38,34 +39,55 @@ def test_real_pipeline():
     print("Batch loaded and moved to GPU successfully:")
     print("  tweet_ids:      ", batch["tweet_ids"].shape)
     print("  price_features: ", batch["price_features"].shape)
+    print("  ss_index:       ", batch["ss_index"].shape)
     print("  T_lengths:      ", batch["T_lengths"][:8].tolist(), "...")
     print("  targets:        ", batch["targets"].shape)
 
-    # 2. Forward pass through MIE
+    # 2. Forward pass through MIE with ss_index and frozen embeddings
     vocab_size = len(mappings.vocab_id_dict)
-    mie = MarketInformationEncoder(vocab_size=vocab_size).to(device)
-    x_t, c_t = mie(batch["tweet_ids"], batch["price_features"], batch["n_words"], batch["n_msgs"])
+    mie = MarketInformationEncoder(vocab_size=vocab_size, freeze_embeddings=True).to(device)
+    assert mie.embedding.weight.requires_grad is False, "Embeddings must remain frozen per paper"
+
+    x_t, c_t = mie(
+        words=batch["tweet_ids"],
+        prices=batch["price_features"],
+        n_words=batch["n_words"],
+        n_msgs=batch["n_msgs"],
+        ss_index=batch["ss_index"]
+    )
     print(f"MIE output verified: x_t = {x_t.shape} (Expected: [32, 5, 103]), c_t = {c_t.shape}")
     assert x_t.shape == (32, 5, 103)
+    assert c_t.shape == (32, 5, 100)
 
-    # 3. Simulate VMD output (Mocking VMD recurrent cell: [B=32, 5, 50])
-    dummy_vmd_H = torch.randn(32, 5, 50, device=device)
+    # 3. Full StockNet Container Forward Pass
+    stocknet = StockNet(vocab_size=vocab_size, freeze_embeddings=True, daily_att="y").to(device)
+    logits, kl_loss, aux_logits, attn_weights = stocknet(batch)
 
-    # 4. Forward pass through ATA
-    ata = AttentiveTemporalAuxiliary(hidden_dim=50, num_classes=2).to(device)
-    logits, attn_weights, aux_logits = ata(dummy_vmd_H, batch["T_lengths"])
-    print(f"ATA output verified: logits = {logits.shape} (Expected: [32, 2]), attn_weights = {attn_weights.shape}")
+    print(f"StockNet output verified:")
+    print(f"  logits:       {logits.shape} (Expected: [32, 2])")
+    print(f"  attn_weights: {attn_weights.shape} (Expected: [32, 5])")
+    print(f"  aux_logits:   {aux_logits.shape} (Expected: [32, 5, 2])")
     assert logits.shape == (32, 2)
+    assert attn_weights.shape == (32, 5)
+    assert aux_logits.shape == (32, 5, 2)
+
+    # 4. Verify Causal Masking on real batch
+    for b in range(32):
+        T = batch["T_lengths"][b].item()
+        target_idx = T - 1
+        assert attn_weights[b, target_idx].item() == 0.0, f"Sample {b}: Target day attention not zero!"
+        for pad_t in range(T, 5):
+            assert attn_weights[b, pad_t].item() == 0.0, f"Sample {b}: Padded day attention not zero!"
 
     # 5. Compute loss and verify backward pass
     loss_fn = torch.nn.CrossEntropyLoss()
     main_loss = loss_fn(logits, batch["targets"])
-    aux_loss = ata.compute_aux_loss(aux_logits, batch["y_historical"], attn_weights, batch["T_lengths"])
+    aux_loss = stocknet.ata.compute_aux_loss(aux_logits, batch["y_historical"], attn_weights, batch["T_lengths"])
     total_loss = main_loss + 0.5 * aux_loss
     total_loss.backward()
 
     print(f"Backward pass verified! Main Loss = {main_loss.item():.4f}, Aux Loss = {aux_loss.item():.4f}")
-    print("\n>>> M1 ARCHITECTURE & M2 DATA INTEGRATION IS 100% OPERATIONAL ON GPU! <<<")
+    print("\n>>> M1 FAITHFUL ARCHITECTURE & REAL DATA INTEGRATION IS 100% OPERATIONAL ON GPU! <<<")
 
 if __name__ == "__main__":
     test_real_pipeline()

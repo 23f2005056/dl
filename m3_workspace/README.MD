@@ -119,3 +119,23 @@ are 97,052 messages and 27,274 unknown-word IDs; IDs range 0..29,866 with
 a 29,867-row embedding vocabulary. The parser was compared against the
 independent full-data scan on 103 sampled files. Sparse examples are AGFS
 (2 files), SPLP (8), and PICO (16), versus AAPL (696).
+
+## E2 price TCN draft (not integrated)
+
+`src/models/tcn.py` contains `CausalPriceTCN`. It takes M2's normalized
+high/low/close tensor `[B, 5, 3]` (oldest step first) and returns
+`[B, 5, 50]`. The two Conv1D layers use 32 then 50 channels, kernel size 2,
+dilations 1 and 2, ReLU, and left-only padding. Its receptive field covers
+at most four time steps. No E0 model path calls this module. When E2 is
+integrated after Gate G4, M4 should join its 50-dimensional output with
+M1's 100-dimensional tweet representation and use `T_batch` to mask any
+time steps padded by M2.
+
+```powershell
+.\.venv\Scripts\python.exe m3_workspace/check_tcn.py
+```
+
+This check uses two genuine five-step AAPL samples from M2's sample builder.
+It verifies `[2, 5, 50]` output, zero gradient from every output step to
+future input steps, the four-step receptive field, and finite backward
+gradients. It is a component check, not E2 training or evaluation.

@@ -49,6 +49,22 @@ batch_builder = StockNetBatchBuilder(
 batch = next(batch_builder.iter_batches("train"))
 
 assert batch["batch_size"] == 32
+# Check evaluation metadata.
+assert len(batch["stock_names"]) == 32
+assert len(batch["target_dates"]) == 32
+assert batch["targets"].shape == (32,)
+
+assert all(isinstance(s, str) for s in batch["stock_names"])
+assert all(isinstance(d, str) for d in batch["target_dates"])
+assert all(len(d) == 10 for d in batch["target_dates"])
+
+assert set(batch["targets"]).issubset({0, 1})
+
+# Check metadata against the original batch arrays.
+for i, T in enumerate(batch["T_batch"]):
+    assert batch["targets"][i] == int(
+        batch["y_batch"][i, T - 1, 1]
+    )
 
 assert batch["stock_batch"].shape == (32,)
 assert batch["T_batch"].shape == (32,)

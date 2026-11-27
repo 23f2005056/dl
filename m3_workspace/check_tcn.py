@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from src.models.tcn import CausalPriceTCN
+from src.models.tcn import PriceTCN
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -38,9 +38,10 @@ for sample in samples:
 assert len(real_prices) == 2, "need two genuine five-step AAPL samples"
 
 torch.manual_seed(0)
-encoder = CausalPriceTCN()
+encoder = PriceTCN()
 prices = torch.tensor(real_prices, dtype=torch.float32, requires_grad=True)
-encoded = encoder(prices)
+lengths = torch.tensor([5, 5], dtype=torch.int64)
+encoded = encoder(prices, lengths)
 assert encoded.shape == (2, 5, 50)
 assert torch.isfinite(encoded).all()
 
@@ -56,8 +57,17 @@ last_gradient = torch.autograd.grad(encoded[:, 4, :].sum(), prices)[0]
 assert torch.count_nonzero(last_gradient[:, 0, :]) == 0
 
 encoder.zero_grad()
-encoder(prices).sum().backward()
+encoder(prices, lengths).sum().backward()
 assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in encoder.parameters())
 
-print("E2 draft TCN passed real-price shape, causal-gradient, and backward checks.")
+# Short samples must remain zero after their true length. Padding values
+# cannot influence a real output, even if they are accidentally nonzero.
+short_lengths = torch.tensor([3, 5], dtype=torch.int64)
+short_prices = prices.detach().clone()
+short_output = encoder(short_prices, short_lengths)
+assert torch.count_nonzero(short_output[0, 3:]) == 0
+short_prices[0, 3:] = 999.0
+assert torch.equal(encoder(short_prices, short_lengths), short_output)
+
+print("E2 TCN passed real-price shape, causal-gradient, padding, and backward checks.")
 print("AAPL target dates:", dates)

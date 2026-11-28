@@ -15,4 +15,19 @@ venv/
 
 # Generated outputs
 *.log
-stocknet-dataset/
+.DS_Store
+
+# Large datasets - review before uploading
+
+
+experiments/*/*
+!experiments/*/*.csv
+!experiments/*/summary.json
+
+*.pt
+
+P18-1183.pdf
+StockNet Stock Movement Prediction from Tweets and Prices — 2-Page Summary.pdf
+StockNet_Maths_Explained.pdf
+
+/stocknet-dataset/

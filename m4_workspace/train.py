@@ -20,6 +20,7 @@ from vmd import VMD
 from losses import kl_lambda, stocknet_loss
 from predict import write_csv
 from e1_integration import E1Integration
+from e2_integration import E2Integration
 from mie import build_glove_matrix
 
 CODE, DATA = ROOT / "stocknet-code", ROOT / "stocknet-dataset"
@@ -76,7 +77,7 @@ def main():
     ap.add_argument("--stocks", help="comma-separated subset for quick runs")
     ap.add_argument("--overfit", type=int, help="overfit N real samples (smoke test)")
     ap.add_argument("--run-name")
-    ap.add_argument("--price-encoder", choices=["raw", "gru"], default="raw",help="raw = E0 (3 raw price features), gru = E1 (M2 GRU price encoder)")
+    ap.add_argument("--price-encoder", choices=["raw", "gru", "tcn"], default="raw", help="raw = E0 (3 raw price features), gru = E1 (M2 GRU price encoder), tcn = E2 (M3 causal TCN)")
     ap.add_argument("--glove", default=str(CODE / "res" / "glove.twitter.27B.50d.txt"),help="GloVe Twitter 50d file (frozen embeddings, as in the original)")
     args = ap.parse_args()
 
@@ -94,6 +95,8 @@ def main():
                      freeze_embeddings=True, daily_att="y")
     if args.price_encoder == "gru":
         model.e1 = E1Integration()      # submodule: trained by Adam, saved in best_dev_model.pt
+    elif args.price_encoder == "tcn":
+        model.e1 = E2Integration()      # same hook as E1, so forward() is unchanged
     model = model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
 
